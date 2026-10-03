@@ -28,18 +28,20 @@ const headers = {
 
 async function runPingOnly() {
     try {
-        // تأخير عشوائي بين 5 إلى 45 ثانية قبل إرسال الطلب لكسر النمط الآلي الثابت
         const initialDelay = randomInt(5000, 45000); 
         console.log(`Stealth Mode: Waiting ${initialDelay / 1000} seconds before pinging...`);
         await sleep(initialDelay);
 
-        // إرسال طلب تحديث الحالة فقط (بدون قراءة رسائل أو طلبات)
         await axios.get('https://www.g2g.com/api/v1/user/ping', { headers });
         console.log("Store QuickSellPro Status: Online 🟢 - Ping sent successfully.");
 
     } catch (error) {
-        console.error("Ping failed: Network issue or cookies might be expired.");
+        console.error("Ping failed details:");
+        if (error.response) {
+            console.error(`Status Code: ${error.response.status}`);
+            console.error(`Data:`, JSON.stringify(error.response.data));
+        } else {
+            console.error(`Message: ${error.message}`);
+        }
     }
 }
-
-runPingOnly();
