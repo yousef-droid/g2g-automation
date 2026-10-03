@@ -1,0 +1,27 @@
+name: G2G Stealth Automation
+
+on:
+  schedule:
+    # يعمل كل 7 دقائق (رقم غير معتاد لتمويه أنظمة الحماية)
+    - cron: '*/7 * * * *'
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install Packages
+        run: npm install
+
+      - name: Start Stealth Bot
+        env:
+          G2G_COOKIES: ${{ secrets.G2G_COOKIES }}
+        run: node bot.js
