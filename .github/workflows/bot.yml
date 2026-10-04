@@ -2,9 +2,14 @@ name: G2G Stealth Automation
 
 on:
   schedule:
-    # يعمل كل 7 دقائق (رقم غير معتاد لتمويه أنظمة الحماية)
-    - cron: '*/7 * * * *'
+    # يحاول التشغيل كل 30 دقيقة
+    - cron: '*/30 * * * *'
   workflow_dispatch:
+
+# منع التداخل: إذا كان السكربت القديم يعمل، يتم تجاهل التشغيل الجديد تماماً
+concurrency:
+  group: g2g-stealth-group
+  cancel-in-progress: false
 
 jobs:
   run-bot:
@@ -19,7 +24,7 @@ jobs:
           node-version: '18'
 
       - name: Install Packages
-        run: npm install
+        run: npm install axios
 
       - name: Start Stealth Bot
         env:
