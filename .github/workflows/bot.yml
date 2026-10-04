@@ -1,15 +1,15 @@
-name: G2G Stealth Automation
+name: G2G Stealth Automation (3-Hour Cycle)
 
 on:
   schedule:
-    # يحاول التشغيل كل 30 دقيقة
-    - cron: '*/30 * * * *'
+    # يحاول تشغيل نفسه تلقائياً كل 3 ساعات
+    - cron: '0 */3 * * *'
   workflow_dispatch:
 
-# منع التداخل: إذا كان السكربت القديم يعمل، يتم تجاهل التشغيل الجديد تماماً
 concurrency:
   group: g2g-stealth-group
-  cancel-in-progress: false
+  # هذا الأمر هو ما يضمن أنه إذا وجد السكريبت يعمل بالفعل، لن يتدخل لإلغائه
+  cancel-in-progress: false 
 
 jobs:
   run-bot:
