@@ -36,23 +36,32 @@ const pingStore = async () => {
 };
 
 (async () => {
-    console.log("--> Starting randomized stealth keep-alive session...");
+    console.log("--> Starting 3-hour stealth keep-alive session...");
     
-    // عدد دورات بين 6 و 8 لتغطية مدة تتراوح بين 40 إلى 50 دقيقة
-    const totalCycles = randomInt(6, 8);
+    // تحديد أقصى مدة للعمل: ساعتين و 55 دقيقة 
+    // لتفادي التداخل والسماح للأكشن القادم بالعمل بسلاسة
+    const maxDurationMs = 2.91 * 60 * 60 * 1000; 
+    const startTime = Date.now();
+    const endTime = startTime + maxDurationMs;
     
-    for (let i = 1; i <= totalCycles; i++) {
+    let cycle = 1;
+
+    while (Date.now() < endTime) {
         await pingStore();
         
-        if (i < totalCycles) {
+        const remainingTimeMs = endTime - Date.now();
+        if (remainingTimeMs > 0) {
             // انتظار عشوائي بين 4 دقائق و 7 دقائق
             const delayMs = randomInt(240000, 420000); 
-            const delayMinutes = (delayMs / 60000).toFixed(2);
             
-            console.log(`Cycle ${i}/${totalCycles} complete. Waiting ${delayMinutes} minutes for next ping...`);
-            await sleep(delayMs);
+            const actualDelayMs = Math.min(delayMs, remainingTimeMs);
+            const delayMinutes = (actualDelayMs / 60000).toFixed(2);
+            
+            console.log(`Cycle ${cycle} complete. Waiting ${delayMinutes} minutes for next ping...`);
+            await sleep(actualDelayMs);
+            cycle++;
         }
     }
     
-    console.log("--> Session finished naturally. Handing over to next trigger.");
+    console.log("--> Session finished naturally after ~2 hours and 55 minutes.");
 })();
