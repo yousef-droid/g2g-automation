@@ -22,33 +22,37 @@ const headers = {
     'Referer': 'https://www.g2g.com/'
 };
 
-(async () => {
+const pingStore = async () => {
     try {
-        console.log("--> Bot execution started for QuickSellPro...");
-        
-        const initialDelay = randomInt(3000, 8000); 
-        console.log(`Stealth Mode: Waiting ${initialDelay / 1000} seconds before pinging...`);
-        await sleep(initialDelay);
-
-        // زيارة صفحة متجرك المباشرة للتحقق من الجلسة وبقائها نشطة
         const response = await axios.get('https://www.g2g.com/QuickSellPro', { headers });
-        
         if (response.status === 200) {
-            console.log("Store QuickSellPro Status: Online 🟢 - Profile session updated successfully!");
-            console.log(`Server Response Code: ${response.status}`);
+            console.log(`[${new Date().toISOString()}] QuickSellPro Status: Online 🟢`);
         } else {
-            console.log(`Received status code: ${response.status}`);
+            console.log(`[${new Date().toISOString()}] Server responded with code: ${response.status}`);
         }
-
     } catch (error) {
-        console.error("Execution failed details:");
-        if (error.response) {
-            console.error(`Status Code: ${error.response.status}`);
-            if (error.response.status === 401 || error.response.status === 403) {
-                console.error("Reason: Session expired or blocked by Cloudflare/Cookies.");
-            }
-        } else {
-            console.error(`Error Message: ${error.message}`);
+        console.error(`[${new Date().toISOString()}] Error pinging store:`, error.response ? error.response.status : error.message);
+    }
+};
+
+(async () => {
+    console.log("--> Starting randomized stealth keep-alive session...");
+    
+    // عدد دورات بين 6 و 8 لتغطية مدة تتراوح بين 40 إلى 50 دقيقة
+    const totalCycles = randomInt(6, 8);
+    
+    for (let i = 1; i <= totalCycles; i++) {
+        await pingStore();
+        
+        if (i < totalCycles) {
+            // انتظار عشوائي بين 4 دقائق و 7 دقائق
+            const delayMs = randomInt(240000, 420000); 
+            const delayMinutes = (delayMs / 60000).toFixed(2);
+            
+            console.log(`Cycle ${i}/${totalCycles} complete. Waiting ${delayMinutes} minutes for next ping...`);
+            await sleep(delayMs);
         }
     }
+    
+    console.log("--> Session finished naturally. Handing over to next trigger.");
 })();
