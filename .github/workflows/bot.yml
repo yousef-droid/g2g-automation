@@ -1,14 +1,14 @@
-name: G2G Stealth Automation (3-Hour Cycle)
+name: G2G Stealth Automation (Continuous)
 
 on:
   schedule:
-    # يحاول تشغيل نفسه تلقائياً كل 3 ساعات
-    - cron: '0 */3 * * *'
+    # سيحاول جيت هاب إطلاق السكريبت على رأس كل ساعة
+    - cron: '0 * * * *'
   workflow_dispatch:
 
 concurrency:
   group: g2g-stealth-group
-  # هذا الأمر هو ما يضمن أنه إذا وجد السكريبت يعمل بالفعل، لن يتدخل لإلغائه
+  # لو جيت هاب حاول يشغل السكريبت ولقاه أصلاً شغال (لأنه بيقعد 5 ساعات و45 دقيقة)، هيسيبه يكمل ومش هيفصله
   cancel-in-progress: false 
 
 jobs:
