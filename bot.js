@@ -36,16 +36,16 @@ const pingStore = async () => {
 };
 
 (async () => {
-    console.log("--> Starting 3-hour stealth keep-alive session...");
+    console.log("--> Starting continuous stealth keep-alive session...");
     
-    // تحديد أقصى مدة للعمل: ساعتين و 55 دقيقة 
-    // لتفادي التداخل والسماح للأكشن القادم بالعمل بسلاسة
-    const maxDurationMs = 2.91 * 60 * 60 * 1000; 
+    // تحديد أقصى مدة للعمل: 5 ساعات و 45 دقيقة (5.75 ساعات)
+    const maxDurationMs = 5.75 * 60 * 60 * 1000; 
     const startTime = Date.now();
     const endTime = startTime + maxDurationMs;
     
     let cycle = 1;
 
+    // السكريبت سيستمر في العمل حتى تنتهي مدة الـ 5 ساعات و 45 دقيقة
     while (Date.now() < endTime) {
         await pingStore();
         
@@ -54,6 +54,7 @@ const pingStore = async () => {
             // انتظار عشوائي بين 4 دقائق و 7 دقائق
             const delayMs = randomInt(240000, 420000); 
             
+            // التأكد من أن وقت الانتظار لا يتخطى الوقت المتبقي لإنهاء السكريبت
             const actualDelayMs = Math.min(delayMs, remainingTimeMs);
             const delayMinutes = (actualDelayMs / 60000).toFixed(2);
             
@@ -63,5 +64,5 @@ const pingStore = async () => {
         }
     }
     
-    console.log("--> Session finished naturally after ~2 hours and 55 minutes.");
+    console.log("--> Session finished successfully after 5 hours and 45 minutes.");
 })();
