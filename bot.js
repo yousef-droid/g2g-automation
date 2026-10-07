@@ -11,7 +11,7 @@ if (!G2G_COOKIES && !FUNPAY_COOKIES) {
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 
-// بصمة متصفح كاملة ومطابقة لمتصفح Chrome حقيقي على Windows
+// بصمة متصفح كاملة لـ G2G
 const g2gHeaders = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
@@ -28,6 +28,7 @@ const g2gHeaders = {
     'Referer': 'https://www.g2g.com/'
 };
 
+// بصمة متصفح كاملة لـ FunPay
 const funpayHeaders = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
@@ -45,7 +46,10 @@ const funpayHeaders = {
 };
 
 const pingG2G = async () => {
-    if (!G2G_COOKIES) return;
+    if (!G2G_COOKIES) {
+        console.log(`[${new Date().toISOString()}] G2G skipped: G2G_COOKIES missing`);
+        return;
+    }
     try {
         const response = await axios.get('https://www.g2g.com/QuickSellPro', { headers: g2gHeaders });
         if (response.status === 200) {
@@ -59,7 +63,10 @@ const pingG2G = async () => {
 };
 
 const pingFunPay = async () => {
-    if (!FUNPAY_COOKIES) return;
+    if (!FUNPAY_COOKIES) {
+        console.log(`[${new Date().toISOString()}] FunPay skipped: FUNPAY_COOKIES missing`);
+        return;
+    }
     try {
         const response = await axios.get('https://funpay.com/', { headers: funpayHeaders });
         if (response.status === 200) {
@@ -74,8 +81,15 @@ const pingFunPay = async () => {
 
 (async () => {
     console.log("--> Starting HIGH-STEALTH keep-alive session for G2G & FunPay...");
-    
-    // أقصى مدة للعمل: 5 ساعات و 45 دقيقة
+
+    if (!FUNPAY_COOKIES) {
+        console.log("⚠️ WARNING: FUNPAY_COOKIES is missing in Action env variables!");
+    }
+    if (!G2G_COOKIES) {
+        console.log("⚠️ WARNING: G2G_COOKIES is missing in Action env variables!");
+    }
+
+    // مدة التشغيل: 5 ساعات و 45 دقيقة
     const maxDurationMs = 5.75 * 60 * 60 * 1000; 
     const startTime = Date.now();
     const endTime = startTime + maxDurationMs;
@@ -83,10 +97,10 @@ const pingFunPay = async () => {
     let cycle = 1;
 
     while (Date.now() < endTime) {
-        // تغيير ترتيب الطلبات والانتظار العشوائي لمنع اكتشاف النمط
+        // عشوائية ترتيب الزيارة وفواصل زمنية بين المواقع لمنع اكتشاف النمط
         if (Math.random() > 0.5) {
             await pingG2G();
-            await sleep(randomInt(3000, 12000)); // فاصل عشوائي بين 3 لـ 12 ثانية بين الموقعين
+            await sleep(randomInt(3000, 12000)); // فاصل عشوائي بين 3 إلى 12 ثانية
             await pingFunPay();
         } else {
             await pingFunPay();
@@ -96,7 +110,7 @@ const pingFunPay = async () => {
         
         const remainingTimeMs = endTime - Date.now();
         if (remainingTimeMs > 0) {
-            // انتظار عشوائي بين 4 دقائق و 7 دقائق
+            // انتظار عشوائي بين 4 إلى 7 دقائق بين كل دورة
             const delayMs = randomInt(240000, 420000); 
             const actualDelayMs = Math.min(delayMs, remainingTimeMs);
             const delayMinutes = (actualDelayMs / 60000).toFixed(2);
