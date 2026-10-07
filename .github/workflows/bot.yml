@@ -1,14 +1,14 @@
-name: G2G Stealth Automation (Continuous)
+name: Stores Stealth Automation (Continuous)
 
 on:
   schedule:
-    # سيحاول جيت هاب إطلاق السكريبت على رأس كل ساعة
+    # يحاول التشغيل كل ساعة للتأكد من استمرار العمل
     - cron: '0 * * * *'
   workflow_dispatch:
 
 concurrency:
-  group: g2g-stealth-group
-  # لو جيت هاب حاول يشغل السكريبت ولقاه أصلاً شغال (لأنه بيقعد 5 ساعات و45 دقيقة)، هيسيبه يكمل ومش هيفصله
+  group: stores-stealth-group
+  # يمنع إيقاف السكربت القديم إذا كان يعمل بالفعل
   cancel-in-progress: false 
 
 jobs:
@@ -29,4 +29,5 @@ jobs:
       - name: Start Stealth Bot
         env:
           G2G_COOKIES: ${{ secrets.G2G_COOKIES }}
+          FUNPAY_COOKIES: ${{ secrets.FUNPAY_COOKIES }}
         run: node bot.js
