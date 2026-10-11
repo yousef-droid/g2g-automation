@@ -50,6 +50,7 @@ jobs:
           # G2G (اختياري): توكن مؤقت للاختبار فقط، وصلاحيته 15 دقيقة
           G2G_ACCESS_TOKEN: ${{ secrets.G2G_ACCESS_TOKEN }}
           G2G_USER_ID: ${{ vars.G2G_USER_ID }}
+          G2G_AUTO_REFRESH: ${{ vars.G2G_AUTO_REFRESH }}
           G2G_LIST_ORDER_URL: ${{ vars.G2G_LIST_ORDER_URL }}
           TEST_MODE: ${{ inputs.test_mode }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
