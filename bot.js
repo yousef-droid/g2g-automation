@@ -9,10 +9,14 @@ const FUNPAY_COOKIES = process.env.FUNPAY_COOKIES;
 
 const FUNPAY_BASE = (process.env.FUNPAY_BASE || 'https://funpay.com').replace(/\/$/, '');
 const FUNPAY_USERNAME = process.env.FUNPAY_USERNAME || 'QuickSellProo';
+const FUNPAY_USER_ID = process.env.FUNPAY_USER_ID || '20896682';
+const FUNPAY_PROFILE_PATH = `/en/users/${FUNPAY_USER_ID}/`;
 
-// الصفحات (الرقم اللي في الرابط /lots/<رقم>/trade) اللي هيتعملها Boost
-const RAISE_NODES = (process.env.FUNPAY_RAISE_NODES || '47,3050,139')
+// الأقسام الافتراضية (كاحتياطي) + يكتشف البوت تلقائياً كل الأقسام من صفحة البروفايل
+const INITIAL_NODES = (process.env.FUNPAY_RAISE_NODES || '47,3050,139')
     .split(',').map(s => s.trim()).filter(Boolean);
+const activeRaiseNodes = new Set(INITIAL_NODES);
+const nodeNames = new Map(); // nodeId -> اسم القسم (مثل Albion Online Accounts)
 
 // اختياري: لو السكربت ماعرفش يلاقي game_id تلقائياً. الصيغة: "47:41,3050:12"
 const GAME_ID_OVERRIDES = Object.fromEntries(
@@ -23,9 +27,11 @@ const GAME_ID_OVERRIDES = Object.fromEntries(
 const RAISE_INTERVAL_MIN = [165, 205];
 // كل قد إيه نسأل FunPay عن المبيعات/الرسائل (وده كمان اللي بيخلي الحساب "Online")
 const RUNNER_INTERVAL_MS = [35000, 65000];
+// كل قد إيه نفحص صفحتك الشخصية لاكتشاف أي عروض جديدة أضفتها (كل ساعة)
+const DISCOVER_INTERVAL_MS = 60 * 60 * 1000;
 
 const TEST_MODE = process.env.TEST_MODE === 'true';
-const TIME_SCALE = Number(process.env.TIME_SCALE || 1); // للاختبار المحلي فقط
+const TIME_SCALE = Number(process.env.TIME_SCALE || 1);
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -51,29 +57,100 @@ const decodeEntities = (s) => String(s)
     .replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&');
 const stripTags = (s) => decodeEntities(String(s || '').replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
+const escapeHtml = (s) => String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+
 const asJson = (d) => {
     if (d && typeof d === 'object') return d;
     try { return JSON.parse(d); } catch { return null; }
 };
 
-/* ---------- Telegram ---------- */
-async function sendTelegram(text) {
-    log(`📨 ${text.split('\n')[0]}`);
-    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return false;
+/* ============================================================
+ *  الترجمة الفورية (Google Translate API مجاني)
+ * ============================================================ */
+async function translateText(text, targetLang = 'ar') {
+    if (!text) return null;
     try {
-        await axios.post(`${TELEGRAM_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        const res = await axios.get('https://translate.googleapis.com/translate_a/single', {
+            params: {
+                client: 'gtx',
+                sl: 'auto',
+                tl: targetLang,
+                dt: 't',
+                q: text
+            },
+            timeout: 10000
+        });
+        if (Array.isArray(res.data) && Array.isArray(res.data[0])) {
+            const translated = res.data[0].map(part => part[0]).join('');
+            const detectedLang = res.data[2] || 'auto';
+            return { translated, detectedLang };
+        }
+    } catch (e) {
+        log('Translation error:', e.message);
+    }
+    return null;
+}
+
+/* ============================================================
+ *  Telegram (إرسال + أزرار + ترجمة + الرد على العملاء)
+ * ============================================================ */
+const tgMessageCache = new Map();
+let awaitingReplyFor = null;
+let tgUpdateOffset = 0;
+
+async function sendTelegram(text, options = {}) {
+    const firstLine = stripTags(text).split('\n')[0];
+    log(`📨 ${firstLine}`);
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return null;
+    try {
+        const payload = {
             chat_id: TELEGRAM_CHAT_ID,
             text,
-            disable_web_page_preview: true
+            parse_mode: options.parse_mode || 'HTML',
+            disable_web_page_preview: true,
+            ...(options.reply_markup ? { reply_markup: options.reply_markup } : {}),
+            ...(options.reply_to_message_id ? { reply_to_message_id: options.reply_to_message_id } : {})
+        };
+        const res = await axios.post(`${TELEGRAM_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, payload, { timeout: 15000 });
+        return res.data && res.data.result ? res.data.result : null;
+    } catch (e) {
+        log('Telegram send failed:', e.response ? JSON.stringify(e.response.data) : e.message);
+        return null;
+    }
+}
+
+async function editTelegramMessage(messageId, text, replyMarkup) {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return false;
+    try {
+        await axios.post(`${TELEGRAM_API}/bot${TELEGRAM_BOT_TOKEN}/editMessageText`, {
+            chat_id: TELEGRAM_CHAT_ID,
+            message_id: messageId,
+            text,
+            parse_mode: 'HTML',
+            disable_web_page_preview: true,
+            ...(replyMarkup ? { reply_markup: replyMarkup } : {})
         }, { timeout: 15000 });
         return true;
     } catch (e) {
-        log('Telegram send failed:', e.response ? JSON.stringify(e.response.data) : e.message);
+        log('Telegram edit failed:', e.response ? JSON.stringify(e.response.data) : e.message);
         return false;
     }
 }
 
-// تنبيهات الأخطاء: مرة واحدة بس لحد ما المشكلة تتحل (عشان مفيش سبام)
+async function answerCallbackQuery(callbackQueryId, text, showAlert = false) {
+    try {
+        await axios.post(`${TELEGRAM_API}/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+            callback_query_id: callbackQueryId,
+            text,
+            show_alert: showAlert
+        }, { timeout: 10000 });
+    } catch { /* ignore */ }
+}
+
 const activeAlerts = new Set();
 async function alertOnce(key, text) {
     if (activeAlerts.has(key)) return;
@@ -82,7 +159,6 @@ async function alertOnce(key, text) {
 }
 const clearAlert = (key) => activeAlerts.delete(key);
 
-// بيساعدك تعرف TELEGRAM_CHAT_ID: ابعت أي رسالة للبوت وبعدين شغّل test_mode
 async function telegramDiscoverChatId() {
     try {
         const r = await axios.get(`${TELEGRAM_API}/bot${TELEGRAM_BOT_TOKEN}/getUpdates`, { timeout: 15000 });
@@ -100,6 +176,41 @@ async function telegramDiscoverChatId() {
     }
 }
 
+function buildFunPayChatKeyboard(chatId, translated = false) {
+    return {
+        inline_keyboard: [
+            [
+                { text: translated ? '🔄 إخفاء الترجمة' : '🌐 ترجمة للعربية', callback_data: `tr:${chatId}` },
+                { text: '✍️ رد من تيليجرام', callback_data: `rep:${chatId}` }
+            ],
+            [
+                { text: '🔗 فتح الشات في FunPay', url: `${FUNPAY_BASE}/en/chat/?node=${chatId}` }
+            ]
+        ]
+    };
+}
+
+function formatFunPayChatAlert({ chatId, name, text, translatedText, lang }) {
+    let msg =
+        `💬 <b>رسالة جديدة على FunPay</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `👤 <b>المرسل:</b> <code>${escapeHtml(name || 'مستخدم')}</code>\n` +
+        `🆔 <b>رقم الشات:</b> <code>#chat_${escapeHtml(chatId)}</code>\n\n` +
+        `📝 <b>النص الأصلي:</b>\n` +
+        `<blockquote>${escapeHtml(text || '(بدون نص)')}</blockquote>`;
+
+    if (translatedText) {
+        msg += `\n\n🌐 <b>الترجمة للعربية${lang ? ` (من ${lang.toUpperCase()})` : ''}:</b>\n` +
+               `<blockquote>${escapeHtml(translatedText)}</blockquote>`;
+    }
+
+    msg += `\n\n💡 <i>للرد السريع: اسحب هذه الرسالة لليمين (Reply) واكتب ردك مباشرة.</i>`;
+    return msg;
+}
+
+/* ============================================================
+ *  إعدادات المتصفح والـ Cookies
+ * ============================================================ */
 const BROWSER_BASE = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
@@ -112,7 +223,7 @@ const BROWSER_BASE = {
     'Sec-Fetch-User': '?1',
     'Upgrade-Insecure-Requests': '1'
 };
-// هيدرز طلبات الـ XHR (زي اللي المتصفح بيبعتها من جوه الصفحة)
+
 const XHR_BASE = {
     'User-Agent': BROWSER_BASE['User-Agent'],
     'Accept': '*/*',
@@ -127,7 +238,7 @@ const XHR_BASE = {
 };
 
 /* ============================================================
- *  G2G (زي ما كان)
+ *  G2G
  * ============================================================ */
 const g2gHeaders = {
     ...BROWSER_BASE,
@@ -154,10 +265,8 @@ const pingG2G = async () => {
 };
 
 /* ============================================================
- *  FunPay
+ *  FunPay: الجلسة + الاكتشاف التلقائي من /en/users/20896682/
  * ============================================================ */
-
-// كوكيز بتتحدث تلقائياً من Set-Cookie (عشان الجلسة PHPSESSID ما تنتهيش)
 class CookieJar {
     constructor(str) {
         this.map = new Map();
@@ -219,15 +328,14 @@ function parseAppData(html) {
 
 function isLoggedIn(html, app) {
     if (app && Number(app.userId) > 0) return true;
-    return html.includes(FUNPAY_USERNAME); // الفحص القديم كاحتياطي
+    return html.includes(FUNPAY_USERNAME);
 }
 
-// بيانات الجلسة (رقم حسابك + csrf) اللي محتاجها طلبات الـ runner
-const ctx = { userId: null, csrf: null };
+const ctx = { userId: FUNPAY_USER_ID, csrf: null };
 
-// بيحمّل الصفحة الرئيسية، يتأكد إن الحساب داخل، ويحدّث بيانات الجلسة
 async function loadFunPaySession() {
-    const res = await fp('get', '/');
+    // ندخل مباشرة على صفحة البروفايل لتحديث الجلسة + الـ CSRF في خطوة واحدة
+    const res = await fp('get', FUNPAY_PROFILE_PATH);
     const html = String(res.data);
     if (res.status !== 200) return { ok: false, status: res.status };
     const app = parseAppData(html);
@@ -236,7 +344,138 @@ async function loadFunPaySession() {
         if (Number(app.userId) > 0) ctx.userId = String(app.userId);
         if (app['csrf-token']) ctx.csrf = app['csrf-token'];
     }
-    return { ok: true };
+    return { ok: true, html };
+}
+
+const nextRaiseAt = new Map();
+
+/**
+ * يفحص صفحة https://funpay.com/en/users/20896682/
+ * ويستخرج كل الأقسام المعروضة حالياً (مثل Albion Online Accounts, Marvel Rivals Accounts, Overwatch 2 Accounts, إلخ)
+ */
+async function discoverFunPayLots(silent = false,prefetchedHtml = null) {
+    if (!FUNPAY_COOKIES) return;
+    try {
+        let html = prefetchedHtml;
+        if (!html) {
+            const res = await fp('get', FUNPAY_PROFILE_PATH);
+            if (res.status !== 200) {
+                log(`Discover lots (${FUNPAY_PROFILE_PATH}): HTTP ${res.status}`);
+                return;
+            }
+            html = String(res.data);
+            const app = parseAppData(html);
+            if (app && app['csrf-token']) ctx.csrf = app['csrf-token'];
+        }
+
+        const discoveredNow = new Map(); // nodeId -> title
+
+        // 1) التقاط عنوان كل قسم (مثل Albion Online Accounts) ورابطه /lots/<id>/
+        for (const m of html.matchAll(/class="offer-list-title"[\s\S]{0,600}?href="[^"]*\/lots\/(\d+)\/?"[^>]*>([\s\S]*?)<\/a>/gi)) {
+            const nodeId = m[1];
+            const title = stripTags(m[2]);
+            if (nodeId) discoveredNow.set(nodeId, title || `Node ${nodeId}`);
+        }
+
+        // 2) التقاط أيقونة القلم (/lots/<id>/trade) الخاصة برفع وتعديل العروض
+        for (const m of html.matchAll(/\/lots\/(\d+)\/trade/gi)) {
+            const nodeId = m[1];
+            if (nodeId && !discoveredNow.has(nodeId)) {
+                discoveredNow.set(nodeId, nodeNames.get(nodeId) || `Node ${nodeId}`);
+            }
+        }
+
+        if (!discoveredNow.size) {
+            log(`⚠️ لم يتم العثور على أقسام في ${FUNPAY_PROFILE_PATH}، سيتم استخدام القائمة الحالية: ${[...activeRaiseNodes].join(', ')}`);
+            return;
+        }
+
+        const newlyAdded = [];
+        for (const [nodeId, title] of discoveredNow) {
+            if (title && !title.startsWith('Node ')) nodeNames.set(nodeId, title);
+            if (!activeRaiseNodes.has(nodeId)) {
+                activeRaiseNodes.add(nodeId);
+                nextRaiseAt.set(nodeId, Date.now() + minutes(randomInt(1, 4)));
+                newlyAdded.push(nodeNames.get(nodeId) ? `${nodeNames.get(nodeId)} (${nodeId})` : nodeId);
+            }
+        }
+
+        // إذا تم حذف قسم بالكامل من حسابك على FunPay، نزيله من الـ Boost حتى لا يفشل
+        for (const oldNode of [...activeRaiseNodes]) {
+            if (!discoveredNow.has(oldNode)) {
+                activeRaiseNodes.delete(oldNode);
+                nextRaiseAt.delete(oldNode);
+                log(`🗑️ تم إزالة القسم [${oldNode}] لأنه لم يعد معروضاً في صفحتك.`);
+            }
+        }
+
+        const summary = [...activeRaiseNodes].map(id => nodeNames.get(id) ? `${nodeNames.get(id)} [${id}]` : id);
+        log(`🔍 FunPay Discovered Offers (${activeRaiseNodes.size}): ${summary.join(' | ')}`);
+
+        if (newlyAdded.length && !silent) {
+            await sendTelegram(
+                `🆕 <b>FunPay: تم اكتشاف عروض جديدة في حسابك!</b>\n` +
+                `━━━━━━━━━━━━━━━━━━\n` +
+                `تمت إضافتها تلقائياً إلى جدول الـ Boost:\n` +
+                newlyAdded.map(x => `• <b>${escapeHtml(x)}</b>`).join('\n')
+            );
+        }
+    } catch (e) {
+        log('discoverFunPayLots error:', e.message);
+    }
+}
+
+/**
+ * إرسال رسالة مباشرة إلى مشتري على FunPay عبر الـ runner
+ */
+async function sendFunPayMessage(chatId, messageText) {
+    if (!FUNPAY_COOKIES) throw new Error('FUNPAY_COOKIES غير موجودة');
+    if (!ctx.userId || !ctx.csrf) {
+        const s = await loadFunPaySession();
+        if (!s.ok || !ctx.csrf) throw new Error('فشل تحميل جلسة FunPay');
+    }
+
+    const objects = [
+        {
+            type: 'chat_node',
+            id: String(chatId),
+            tag: '00000000',
+            data: { node: String(chatId), last_message: -1, content: '' }
+        }
+    ];
+    const requestPayload = {
+        action: 'chat_message',
+        data: {
+            node: String(chatId),
+            last_message: -1,
+            content: messageText
+        }
+    };
+
+    const body = new URLSearchParams({
+        objects: JSON.stringify(objects),
+        request: JSON.stringify(requestPayload),
+        csrf_token: ctx.csrf
+    });
+
+    const res = await fp('post', '/runner/', {
+        xhr: true,
+        data: body.toString(),
+        headers: {
+            'Origin': FUNPAY_BASE,
+            'Referer': `${FUNPAY_BASE}/en/chat/?node=${chatId}`
+        }
+    });
+
+    const json = asJson(res.data);
+    if (res.status !== 200 || !json) {
+        ctx.csrf = null;
+        throw new Error(`HTTP ${res.status}`);
+    }
+    if (json.response && json.response.error) {
+        throw new Error(stripTags(json.response.error));
+    }
+    return true;
 }
 
 const pingFunPay = async () => {
@@ -249,10 +488,10 @@ const pingFunPay = async () => {
         if (r.ok) {
             log('FunPay Status: Online 🟢');
             clearAlert('funpay-logout');
-            return true;
+            return r.html;
         } else if (r.loggedOut) {
             log('FunPay Error: Cookies Expired / Logged Out 🔴');
-            await alertOnce('funpay-logout', '🔴 FunPay: الكوكيز انتهت / الحساب اتفصل.\nحدّث FUNPAY_COOKIES في GitHub Secrets.');
+            await alertOnce('funpay-logout', '🔴 <b>FunPay:</b> الكوكيز انتهت أو الحساب خرج.\nيرجى تحديث <code>FUNPAY_COOKIES</code> في GitHub Secrets.');
         } else {
             log(`FunPay Response Code: ${r.status}`);
         }
@@ -265,17 +504,16 @@ const pingFunPay = async () => {
 /* ---------- Runner: المبيعات + الرسائل + البقاء Online ---------- */
 const rs = {
     ordersTag: randomTag(), chatTag: randomTag(),
-    sellers: null,            // عدد المبيعات النشطة (null = لسه ماقرأناش)
+    sellers: null,
     chat: null, chatMsg: null,
     bookTag: randomTag(),
-    bookmarksOk: false,       // true لما نقدر نقرا نص الرسائل (chat_bookmarks)
+    bookmarksOk: false,
     fails: 0
 };
-const chatSeen = new Map();   // chatId -> آخر رسالة اتعاملنا معاها
+const chatSeen = new Map();
 let bookBaseline = false;
 const seenOrders = new Set();
 
-// بيقرأ صفحة المبيعات ويطلّع الطلبات المدفوعة (best-effort، لو شكل الصفحة اتغير بيرجع [])
 function parseSales(html) {
     const out = [];
     for (const b of html.split(/<a[^>]+class="tc-item/).slice(1)) {
@@ -303,16 +541,36 @@ async function checkNewSales({ silent, prev, now }) {
     if (silent) return;
     if (fresh.length) {
         for (const s of fresh.reverse()) {
+            const orderUrl = `${FUNPAY_BASE}/en/orders/${s.id}/`;
             await sendTelegram(
-                `🛒 FunPay: عملية بيع جديدة!\n` +
-                `#${s.id}${s.price ? ` — ${s.price}` : ''}\n` +
-                `${s.desc ? s.desc + '\n' : ''}` +
-                `${s.buyer ? 'المشتري: ' + s.buyer + '\n' : ''}` +
-                `${FUNPAY_BASE}/en/orders/${s.id}/`);
+                `💰 <b>FunPay: عملية بيع جديدة!</b>\n` +
+                `━━━━━━━━━━━━━━━━━━\n` +
+                `🧾 <b>رقم الطلب:</b> <code>#${escapeHtml(s.id)}</code>\n` +
+                (s.price ? `💵 <b>السعر:</b> <b>${escapeHtml(s.price)}</b>\n` : '') +
+                (s.buyer ? `👤 <b>المشتري:</b> <code>${escapeHtml(s.buyer)}</code>\n` : '') +
+                (s.desc ? `\n📦 <b>العرض:</b>\n<blockquote>${escapeHtml(s.desc)}</blockquote>\n` : ''),
+                {
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: '📦 فتح صفحة الطلب في FunPay', url: orderUrl }]
+                        ]
+                    }
+                }
+            );
         }
     } else if (now > prev) {
-        // العدّاد زاد بس ماعرفناش نقرأ تفاصيل الطلب
-        await sendTelegram(`🛒 FunPay: في عملية بيع جديدة (عدد المبيعات النشطة: ${now})\n${FUNPAY_BASE}/en/orders/trade`);
+        await sendTelegram(
+            `💰 <b>FunPay: عملية بيع جديدة!</b>\n` +
+            `━━━━━━━━━━━━━━━━━━\n` +
+            `📊 عدد المبيعات النشطة الآن: <b>${now}</b>`,
+            {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '📦 عرض المبيعات', url: `${FUNPAY_BASE}/en/orders/trade` }]
+                    ]
+                }
+            }
+        );
     }
 }
 
@@ -320,7 +578,7 @@ async function onOrdersCounters(d) {
     const seller = Number(d.seller) || 0;
     const prev = rs.sellers;
     rs.sellers = seller;
-    if (prev === null) {                 // أول قراءة: baseline بدون تنبيه
+    if (prev === null) {
         log(`FunPay sales counter: ${seller}`);
         if (seller > 0) await checkNewSales({ silent: true });
         return;
@@ -328,8 +586,6 @@ async function onOrdersCounters(d) {
     if (seller !== prev) await checkNewSales({ silent: false, prev, now: seller });
 }
 
-
-// بيقرا قايمة المحادثات (بنفس شكل اللي بتشوفه في صفحة Chat) ويطلّع الرسائل الجديدة بنصها
 function parseContacts(html) {
     const out = [];
     for (const m of String(html || '').matchAll(/<a\b[^>]*class="[^"]*contact-item[^"]*"[^>]*>[\s\S]*?<\/a>/g)) {
@@ -352,7 +608,7 @@ async function onChatBookmarks(d) {
     const contacts = parseContacts(d.html);
     if (!contacts.length) return;
     rs.bookmarksOk = true;
-    if (!bookBaseline) {                 // أول قراءة: baseline بدون تنبيه
+    if (!bookBaseline) {
         bookBaseline = true;
         contacts.forEach(c => chatSeen.set(c.id, c.nodeMsg));
         return;
@@ -361,11 +617,29 @@ async function onChatBookmarks(d) {
         const seen = chatSeen.get(c.id);
         chatSeen.set(c.id, c.nodeMsg);
         if (c.unread && c.nodeMsg && c.nodeMsg !== seen) {
-            const text = c.text.length > 600 ? c.text.slice(0, 600) + '…' : c.text;
-            await sendTelegram(
-                `💬 FunPay: رسالة من ${c.name || 'مستخدم'}\n` +
-                `${text || '(بدون نص)'}\n` +
-                `${FUNPAY_BASE}/en/chat/?node=${c.id}`);
+            const text = c.text.length > 800 ? c.text.slice(0, 800) + '…' : c.text;
+            const formatted = formatFunPayChatAlert({
+                chatId: c.id,
+                name: c.name,
+                text
+            });
+            const sent = await sendTelegram(formatted, {
+                reply_markup: buildFunPayChatKeyboard(c.id, false)
+            });
+            if (sent && sent.message_id) {
+                tgMessageCache.set(sent.message_id, {
+                    chatId: c.id,
+                    senderName: c.name || 'مستخدم',
+                    originalText: text,
+                    translatedText: null,
+                    lang: null,
+                    showingTranslation: false
+                });
+                if (tgMessageCache.size > 200) {
+                    const oldestKey = tgMessageCache.keys().next().value;
+                    tgMessageCache.delete(oldestKey);
+                }
+            }
         }
     }
 }
@@ -377,12 +651,21 @@ async function onChatCounter(d) {
     const prevMsg = rs.chatMsg;
     rs.chat = counter;
     rs.chatMsg = msgId;
-    if (prev === null) {                 // أول قراءة: baseline بدون تنبيه
+    if (prev === null) {
         log(`FunPay unread chats: ${counter}`);
         return;
     }
     if (!rs.bookmarksOk && counter > 0 && (counter > prev || msgId !== prevMsg)) {
-        await sendTelegram(`💬 FunPay: رسالة جديدة (غير مقروءة: ${counter})\n${FUNPAY_BASE}/en/chat/`);
+        await sendTelegram(
+            `💬 <b>FunPay: لديك رسائل غير مقروءة (${counter})</b>`,
+            {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '💬 فتح الشات في FunPay', url: `${FUNPAY_BASE}/en/chat/` }]
+                    ]
+                }
+            }
+        );
     }
 }
 
@@ -391,7 +674,7 @@ async function pollRunner() {
     try {
         if (!ctx.userId || !ctx.csrf) {
             const r = await loadFunPaySession();
-            if (!r.ok || !ctx.userId) throw new Error(r.loggedOut ? 'logged out' : 'no session data');
+            if (!r.ok || !ctx.csrf) throw new Error(r.loggedOut ? 'logged out' : 'no session data');
         }
         const objects = [
             { type: 'orders_counters', id: ctx.userId, tag: rs.ordersTag, data: false },
@@ -407,7 +690,7 @@ async function pollRunner() {
         const json = asJson(res.data);
         if (TEST_MODE) log(`runner raw (HTTP ${res.status}): ${JSON.stringify(json || String(res.data).slice(0, 200)).slice(0, 400)}`);
         if (res.status !== 200 || !json || !Array.isArray(json.objects)) {
-            ctx.csrf = null; // نجدد الجلسة في المحاولة الجاية
+            ctx.csrf = null;
             throw new Error(`bad runner response (HTTP ${res.status})`);
         }
         const book = json.objects.find(o => o.type === 'chat_bookmarks');
@@ -416,15 +699,186 @@ async function pollRunner() {
             if (o.type === 'orders_counters') { if (o.tag) rs.ordersTag = o.tag; await onOrdersCounters(o.data || {}); }
             else if (o.type === 'chat_counter') { if (o.tag) rs.chatTag = o.tag; await onChatCounter(o.data || {}); }
         }
-        if (rs.fails >= 5) await sendTelegram('🟢 FunPay: الاتصال رجع طبيعي.');
+        if (rs.fails >= 5) await sendTelegram('🟢 <b>FunPay:</b> الاتصال عاد للعمل بشكل طبيعي.');
         rs.fails = 0;
         clearAlert('runner-fail');
     } catch (e) {
         rs.fails++;
         log(`runner error (${rs.fails}): ${e.message}`);
         if (rs.fails >= 5) {
-            await alertOnce('runner-fail', `⚠️ FunPay: فشل الاتصال ${rs.fails} مرات ورا بعض (${e.message}).\nممكن الحساب يظهر Offline، راجع الكوكيز.`);
+            await alertOnce('runner-fail', `⚠️ <b>FunPay:</b> فشل الاتصال ${rs.fails} مرات متتالية (${escapeHtml(e.message)}).\nراجع صلاحية الكوكيز.`);
         }
+    }
+}
+
+/* ============================================================
+ *  استقبال أوامر تيليجرام (زر الترجمة + الرد على العملاء)
+ * ============================================================ */
+async function pollTelegramUpdates() {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+    try {
+        const res = await axios.get(`${TELEGRAM_API}/bot${TELEGRAM_BOT_TOKEN}/getUpdates`, {
+            params: {
+                offset: tgUpdateOffset,
+                timeout: 0,
+                allowed_updates: JSON.stringify(['message', 'callback_query'])
+            },
+            timeout: 12000
+        });
+        const updates = (res.data && res.data.result) || [];
+        for (const u of updates) {
+            tgUpdateOffset = u.update_id + 1;
+
+            // 1) التعامل مع الأزرار (ترجمة / طلب رد)
+            if (u.callback_query) {
+                const cb = u.callback_query;
+                const fromChatId = String(cb.message && cb.message.chat && cb.message.chat.id);
+                if (fromChatId !== String(TELEGRAM_CHAT_ID)) continue;
+
+                const data = String(cb.data || '');
+                const msgId = cb.message.message_id;
+
+                if (data.startsWith('tr:')) {
+                    const fpChatId = data.slice(3);
+                    let cached = tgMessageCache.get(msgId);
+
+                    if (!cached) {
+                        const rawText = cb.message.text || '';
+                        const mName = rawText.match(/المرسل:\s*(.+)/);
+                        const mOrig = rawText.match(/النص الأصلي:\n([\s\S]*?)(?:\n\n🌐|\n\n💡|$)/);
+                        cached = {
+                            chatId: fpChatId,
+                            senderName: mName ? mName[1].trim() : 'مستخدم',
+                            originalText: mOrig ? mOrig[1].trim() : rawText,
+                            translatedText: null,
+                            lang: null,
+                            showingTranslation: false
+                        };
+                        tgMessageCache.set(msgId, cached);
+                    }
+
+                    if (cached.showingTranslation) {
+                        cached.showingTranslation = false;
+                        await editTelegramMessage(
+                            msgId,
+                            formatFunPayChatAlert({
+                                chatId: cached.chatId,
+                                name: cached.senderName,
+                                text: cached.originalText
+                            }),
+                            buildFunPayChatKeyboard(cached.chatId, false)
+                        );
+                        await answerCallbackQuery(cb.id, 'تم إخفاء الترجمة');
+                    } else {
+                        await answerCallbackQuery(cb.id, '⏳ جاري الترجمة إلى العربية...');
+                        if (!cached.translatedText) {
+                            const tr = await translateText(cached.originalText, 'ar');
+                            if (tr && tr.translated) {
+                                cached.translatedText = tr.translated;
+                                cached.lang = tr.detectedLang;
+                            } else {
+                                await answerCallbackQuery(cb.id, '❌ تعذرت الترجمة حالياً', true);
+                                continue;
+                            }
+                        }
+                        cached.showingTranslation = true;
+                        await editTelegramMessage(
+                            msgId,
+                            formatFunPayChatAlert({
+                                chatId: cached.chatId,
+                                name: cached.senderName,
+                                text: cached.originalText,
+                                translatedText: cached.translatedText,
+                                lang: cached.lang
+                            }),
+                            buildFunPayChatKeyboard(cached.chatId, true)
+                        );
+                    }
+                } else if (data.startsWith('rep:')) {
+                    const fpChatId = data.slice(4);
+                    const cached = tgMessageCache.get(msgId);
+                    const senderName = cached ? cached.senderName : `شات #${fpChatId}`;
+                    awaitingReplyFor = { chatId: fpChatId, senderName };
+                    await answerCallbackQuery(cb.id, `✍️ اكتب ردك الآن لإرساله إلى ${senderName}`);
+                    await sendTelegram(
+                        `✍️ <b>وضع الرد المباشر مفعّل</b>\n` +
+                        `أرسل رسالتك الآن ليتم إرسالها فوراً إلى <b>${escapeHtml(senderName)}</b> (شات <code>#${escapeHtml(fpChatId)}</code>).\n` +
+                        `<i>لإلغاء الرد أرسل /cancel</i>`,
+                        {
+                            reply_to_message_id: msgId,
+                            reply_markup: { force_reply: true, selective: true }
+                        }
+                    );
+                }
+            }
+
+            // 2) التعامل مع الرسائل النصية (الرد على العملاء أو الأوامر)
+            if (u.message && u.message.text) {
+                const msg = u.message;
+                if (String(msg.chat.id) !== String(TELEGRAM_CHAT_ID)) continue;
+                const text = msg.text.trim();
+
+                if (text === '/cancel') {
+                    awaitingReplyFor = null;
+                    await sendTelegram('✅ تم إلغاء وضع الرد.', { reply_to_message_id: msg.message_id });
+                    continue;
+                }
+
+                if (text === '/discover' || text === '/lots') {
+                    await sendTelegram(`🔍 جاري فحص صفحتك (<code>${FUNPAY_PROFILE_PATH}</code>)...`, { reply_to_message_id: msg.message_id });
+                    await discoverFunPayLots(false);
+                    const allList = [...activeRaiseNodes].map(id => `• <b>${escapeHtml(nodeNames.get(id) || 'قسم')}</b> (<code>${id}</code>)`);
+                    await sendTelegram(
+                        `📋 <b>أقسام الـ Boost النشطة حالياً (${activeRaiseNodes.size}):</b>\n` +
+                        allList.join('\n'),
+                        { reply_to_message_id: msg.message_id }
+                    );
+                    continue;
+                }
+
+                let targetChatId = null;
+                let targetName = 'المشتري';
+
+                if (msg.reply_to_message) {
+                    const repliedId = msg.reply_to_message.message_id;
+                    const cached = tgMessageCache.get(repliedId);
+                    if (cached) {
+                        targetChatId = cached.chatId;
+                        targetName = cached.senderName;
+                    } else {
+                        const repText = msg.reply_to_message.text || '';
+                        const matchId = repText.match(/#chat_(\d+)/) || repText.match(/#(\d+)/);
+                        const matchName = repText.match(/المرسل:\s*(.+)/);
+                        if (matchId) targetChatId = matchId[1];
+                        if (matchName) targetName = matchName[1].trim();
+                    }
+                }
+
+                if (!targetChatId && awaitingReplyFor) {
+                    targetChatId = awaitingReplyFor.chatId;
+                    targetName = awaitingReplyFor.senderName;
+                }
+
+                if (targetChatId && !text.startsWith('/')) {
+                    try {
+                        await sendFunPayMessage(targetChatId, text);
+                        awaitingReplyFor = null;
+                        await sendTelegram(
+                            `✅ <b>تم إرسال ردك بنجاح إلى ${escapeHtml(targetName)}!</b>\n` +
+                            `<blockquote>${escapeHtml(text)}</blockquote>`,
+                            { reply_to_message_id: msg.message_id }
+                        );
+                    } catch (e) {
+                        await sendTelegram(
+                            `❌ <b>فشل إرسال الرد إلى FunPay:</b>\n<code>${escapeHtml(e.message)}</code>`,
+                            { reply_to_message_id: msg.message_id }
+                        );
+                    }
+                }
+            }
+        }
+    } catch (e) {
+        log('pollTelegramUpdates error:', e.message);
     }
 }
 
@@ -443,7 +897,6 @@ function findGameId(html) {
     return null;
 }
 
-// يفهم رسالة الانتظار: "Please wait 3 hours" / "Подождите 28 минут" ... الخ
 function parseWaitMs(msg) {
     const t = String(msg || '').toLowerCase();
     const part = (numRe, articleRe, unitMs) => {
@@ -459,29 +912,29 @@ function parseWaitMs(msg) {
     return ms > 0 ? ms : null;
 }
 
-// يضغط "Boost offers" لصفحة واحدة. بيرجع { ok, nextInMs, fatal }
 async function raiseNode(nodeId) {
     const tradePath = `/en/lots/${nodeId}/trade`;
     const page = await fp('get', tradePath);
+    const label = nodeNames.get(nodeId) ? `${nodeId} (${nodeNames.get(nodeId)})` : nodeId;
+
     if (page.status !== 200) {
-        log(`Raise[${nodeId}] ✗ trade page HTTP ${page.status}`);
+        log(`Raise[${label}] ✗ trade page HTTP ${page.status}`);
         return { ok: false, nextInMs: minutes(randomInt(15, 30)) };
     }
     const html = String(page.data);
     const app = parseAppData(html);
     if (!isLoggedIn(html, app)) {
-        log(`Raise[${nodeId}] ✗ logged out 🔴`);
+        log(`Raise[${label}] ✗ logged out 🔴`);
         return { ok: false, fatal: true, nextInMs: minutes(60) };
     }
 
     const gameId = GAME_ID_OVERRIDES[nodeId] || findGameId(html);
     if (!gameId) {
-        log(`Raise[${nodeId}] ✗ game_id not found in page. (حط FUNPAY_GAME_IDS="${nodeId}:<game_id>")`);
-        await alertOnce(`gameid-${nodeId}`, `⚠️ FunPay: مش قادر ألاقي game_id للصفحة ${nodeId}. شوف الـ logs.`);
+        log(`Raise[${label}] ✗ game_id not found in page.`);
         return { ok: false, nextInMs: minutes(randomInt(60, 90)) };
     }
 
-    await sleep(randomInt(2000, 7000)); // تأخير بشري قبل "الضغط"
+    await sleep(randomInt(2000, 7000));
 
     const postRaise = async (extra) => {
         const body = new URLSearchParams({ game_id: gameId, node_id: nodeId });
@@ -497,20 +950,17 @@ async function raiseNode(nodeId) {
     let res = await postRaise();
     let json = asJson(res.data);
 
-    // أحياناً بيرجع نافذة اختيار فئات (modal) → نختار الفئة بتاعتنا بس
     if (json && json.modal) {
         const ids = [...String(json.modal).matchAll(/<input[^>]*name="node_ids\[\]"[^>]*>/g)]
             .map(m => (m[0].match(/value="(\d+)"/) || [])[1]).filter(Boolean);
-        if (ids.length && !ids.includes(String(nodeId))) {
-            log(`Raise[${nodeId}] ⚠ modal لا يحتوي الفئة دي، الموجود: ${ids.join(',')}`);
-        }
+        const toSend = ids.length ? ids.map(id => ['node_ids[]', String(id)]) : [['node_ids[]', String(nodeId)]];
         await sleep(randomInt(1500, 4000));
-        res = await postRaise([['node_ids[]', String(nodeId)]]);
+        res = await postRaise(toSend);
         json = asJson(res.data);
     }
 
     if (!json) {
-        log(`Raise[${nodeId}] ✗ unexpected response (HTTP ${res.status}): ${stripTags(res.data).slice(0, 200)}`);
+        log(`Raise[${label}] ✗ unexpected response (HTTP ${res.status}): ${stripTags(res.data).slice(0, 200)}`);
         return { ok: false, nextInMs: minutes(randomInt(30, 60)) };
     }
 
@@ -518,30 +968,29 @@ async function raiseNode(nodeId) {
     if (json.error || json.url) {
         const waitMs = parseWaitMs(msg);
         if (waitMs) {
-            log(`Raise[${nodeId}] ⏳ cooldown (game_id=${gameId}): "${msg}"`);
+            log(`Raise[${label}] ⏳ cooldown (game_id=${gameId}): "${msg}"`);
             return { ok: false, nextInMs: waitMs + minutes(randomInt(1, 6)) };
         }
-        log(`Raise[${nodeId}] ✗ FunPay said: "${msg}"`);
+        log(`Raise[${label}] ✗ FunPay said: "${msg}"`);
         return { ok: false, nextInMs: minutes(randomInt(30, 50)) };
     }
 
-    log(`Raise[${nodeId}] ✅ boosted (game_id=${gameId})${msg ? ` — "${msg}"` : ''}`);
+    log(`Raise[${label}] ✅ boosted (game_id=${gameId})${msg ? ` — "${msg}"` : ''}`);
     return { ok: true, nextInMs: minutes(randomInt(...RAISE_INTERVAL_MIN)) };
 }
 
-const nextRaiseAt = new Map();
-
 async function runDueRaises() {
     if (!FUNPAY_COOKIES) return;
-    const due = shuffle(RAISE_NODES.filter(n => (nextRaiseAt.get(n) || 0) <= Date.now()));
+    const allNodes = [...activeRaiseNodes];
+    const due = shuffle(allNodes.filter(n => (nextRaiseAt.get(n) || 0) <= Date.now()));
     for (let i = 0; i < due.length; i++) {
         const node = due[i];
         try {
             const r = await raiseNode(node);
             nextRaiseAt.set(node, Date.now() + r.nextInMs);
             if (r.fatal) {
-                await alertOnce('funpay-logout', '🔴 FunPay: الكوكيز انتهت، مفيش Boost هيحصل. حدّث FUNPAY_COOKIES.');
-                RAISE_NODES.forEach(n => nextRaiseAt.set(n, Date.now() + r.nextInMs));
+                await alertOnce('funpay-logout', '🔴 <b>FunPay:</b> الكوكيز انتهت، توقف الـ Boost التلقائي. حدّث <code>FUNPAY_COOKIES</code>.');
+                allNodes.forEach(n => nextRaiseAt.set(n, Date.now() + r.nextInMs));
                 return;
             }
             log(`Raise[${node}] next attempt in ~${(r.nextInMs / 3600000).toFixed(2)}h`);
@@ -549,20 +998,17 @@ async function runDueRaises() {
             log(`Raise[${node}] ✗ error: ${e.message}`);
             nextRaiseAt.set(node, Date.now() + minutes(randomInt(15, 30)));
         }
-        if (i < due.length - 1) await sleep(randomInt(25000, 90000)); // فاصل عشوائي بين الصفحات
+        if (i < due.length - 1) await sleep(randomInt(25000, 90000));
     }
 }
 
-
 /* ============================================================
- *  G2G: تنبيهات المبيعات (نفس الطلب اللي الجرس في الموقع بيستخدمه)
+ *  G2G: تنبيهات المبيعات وتجديد التوكن
  * ============================================================ */
 const G2G_USER_ID = process.env.G2G_USER_ID || '1002988142';
 const G2G_API = (process.env.G2G_API || 'https://sls.g2g.com').replace(/\/$/, '');
-// اختياري: رابط list_my_order الكامل (من Network) عشان نضيف الكمية والسعر في التنبيه
 const G2G_LIST_ORDER_URL = process.env.G2G_LIST_ORDER_URL;
 const G2G_POLL_MS = [90000, 150000];
-// تجديد التوكن تلقائياً (اتأكد من اللوج الأول، شوف README)
 const G2G_AUTO_REFRESH = process.env.G2G_AUTO_REFRESH === 'true';
 
 const g2gJar = new CookieJar(G2G_COOKIES);
@@ -585,7 +1031,6 @@ function pickJwt(text, source) {
     return null;
 }
 
-// أسماء الحقول فقط (من غير أي قيم) عشان التشخيص
 function keyNames(o, prefix = '') {
     if (o === null || typeof o !== 'object') return [];
     return Object.entries(o).flatMap(([k, v]) =>
@@ -600,8 +1045,6 @@ function collectStrings(o, out = {}) {
     return out;
 }
 
-
-// تحويل قيمة انتهاء (ثواني / ملي ثانية / نص تاريخ) إلى ملي ثانية
 function toMs(v) {
     if (v === undefined || v === null || v === '') return null;
     const n = Number(v);
@@ -610,7 +1053,6 @@ function toMs(v) {
     return Number.isFinite(d) ? d : null;
 }
 
-// بيحسب فاضل قد إيه على انتهاء مفاتيح التجديد، ويحذّرك قبلها بـ 3 أيام
 async function checkKeyExpiry(strsOrObj) {
     const flat = collectAny(strsOrObj);
     const items = ['refresh_token_exp', 'long_lived_token_exp', 'active_device_token_exp']
@@ -621,7 +1063,7 @@ async function checkKeyExpiry(strsOrObj) {
     const soon = days.filter(([, d]) => d < 3);
     if (soon.length) {
         await alertOnce('g2g-keys-expiry',
-            `⏰ G2G: مفاتيح التجديد قربت تنتهي (${soon.map(([k, d]) => `${k}: ${d.toFixed(1)} يوم`).join('، ')}).\nسجّل دخول G2G من المتصفح وحدّث G2G_COOKIES في GitHub Secrets.`);
+            `⏰ <b>G2G:</b> مفاتيح التجديد قاربت على الانتهاء (${soon.map(([k, d]) => `${k}: ${d.toFixed(1)} يوم`).join('، ')}).\nسجّل دخول G2G من المتصفح وحدّث <code>G2G_COOKIES</code>.`);
     }
 }
 function collectAny(o, out = {}) {
@@ -633,7 +1075,6 @@ function collectAny(o, out = {}) {
     return out;
 }
 
-// تجديد التوكن بنفس طريقة الموقع: POST /user/refresh_access (بيشتغل بس لو G2G_AUTO_REFRESH=true)
 async function refreshG2gAccess() {
     const val = (n) => g2gJar.map.get(n);
     if (!val('refresh_token')) {
@@ -646,7 +1087,7 @@ async function refreshG2gAccess() {
         long_lived_token: val('long_lived_token'),
         active_device_token: val('active_device_token')
     };
-    const stale = g2g.token || process.env.G2G_ACCESS_TOKEN; // الموقع بيبعت آخر توكن خلص في Authorization
+    const stale = g2g.token || process.env.G2G_ACCESS_TOKEN;
     const res = await axios.post(`${G2G_API}/user/refresh_access`, body, {
         headers: {
             'User-Agent': BROWSER_BASE['User-Agent'],
@@ -664,22 +1105,20 @@ async function refreshG2gAccess() {
     log(`G2G refresh → HTTP ${res.status}${names ? ` | fields: ${names}` : ''}`);
     if (res.status !== 200) return null;
 
-    // لو السيرفر رجّع مفاتيح تجديد جديدة نستخدمها ونحذّرك (الـ Secret ممكن يبقى قديم)
     const strs = collectStrings(res.data);
     for (const k of ['refresh_token', 'long_lived_token', 'active_device_token']) {
         if (strs[k] && strs[k] !== val(k)) {
             g2gJar.map.set(k, strs[k]);
             await alertOnce(`g2g-rotated-${k}`,
-                `⚠️ G2G: السيرفر بيغيّر ${k} مع كل تجديد.\nالبوت هيكمل بالجديد في التشغيل ده، لكن لازم نحفظه بين التشغيلات (قولي).`);
+                `⚠️ <b>G2G:</b> السيرفر قام بتغيير <code>${k}</code> أثناء التجديد.`);
         }
     }
     await checkKeyExpiry(res.data);
     return pickJwt(typeof res.data === 'string' ? res.data : JSON.stringify(res.data), 'refresh_access');
 }
 
-// بيدور على توكن صالح (بدون ما يطبعه في اللوج أبداً)
 async function discoverG2gToken() {
-    if (Date.now() < g2g.retryAt) return false;       // استنى بعد آخر فشل
+    if (Date.now() < g2g.retryAt) return false;
     let f = pickJwt(process.env.G2G_ACCESS_TOKEN, 'secret G2G_ACCESS_TOKEN');
     if (!f) {
         for (const [k, v] of g2gJar.map) {
@@ -719,11 +1158,10 @@ async function g2gGet(url) {
         },
         timeout: 20000, validateStatus: () => true
     });
-    if (res.status === 401 || res.status === 403) g2g.token = null; // نجرب نجيب توكن جديد المرة الجاية
+    if (res.status === 401 || res.status === 403) g2g.token = null;
     return res;
 }
 
-// بيجيب الكمية والسعر للطلبات الجديدة (لو G2G_LIST_ORDER_URL متحدد)
 async function g2gOrderDetails() {
     if (!G2G_LIST_ORDER_URL) return {};
     try {
@@ -736,9 +1174,9 @@ async function g2gOrderDetails() {
 
 function g2gDetailLine(r) {
     if (!r) return '';
-    let line = `الكمية: ${r.purchased_qty} | السعر: ${r.offer_amount} ${r.offer_currency}`;
+    let line = `📦 <b>الكمية:</b> ${escapeHtml(r.purchased_qty)} | 💵 <b>السعر:</b> <b>${escapeHtml(r.offer_amount)} ${escapeHtml(r.offer_currency)}</b>`;
     if (r.checkout_currency && r.checkout_currency !== r.offer_currency) {
-        line += ` (المشتري دفع ${r.amount} ${r.checkout_currency})`;
+        line += ` <i>(دفع المشتري: ${escapeHtml(r.amount)} ${escapeHtml(r.checkout_currency)})</i>`;
     }
     return line + '\n';
 }
@@ -761,7 +1199,7 @@ async function pollG2G() {
             .filter(o => o.id && !g2gSeen.has(o.id));
         fresh.forEach(o => g2gSeen.add(o.id));
 
-        if (!g2g.baseline) {                       // أول قراءة: baseline بدون تنبيه
+        if (!g2g.baseline) {
             g2g.baseline = true;
             g2g.cancel = cancel;
             log(`G2G notifications: sold=${sold.length} purchases=${bought.length} cancellations=${cancel}`);
@@ -769,23 +1207,48 @@ async function pollG2G() {
             if (fresh.length) {
                 const details = await g2gOrderDetails();
                 for (const o of fresh) {
-                    const head = o.kind === 'sold' ? '🛒 G2G: عملية بيع جديدة!' : '🧾 G2G: تحديث على طلب شراء';
-                    await sendTelegram(`${head}\n#${o.id}\n${o.title || ''}\n${g2gDetailLine(details[o.id])}${o.url || ''}`);
+                    const head = o.kind === 'sold' ? '💰 <b>G2G: عملية بيع جديدة!</b>' : '🧾 <b>G2G: تحديث على طلب شراء</b>';
+                    const orderUrl = o.url || 'https://www.g2g.com/g2g-user/sale';
+                    await sendTelegram(
+                        `${head}\n` +
+                        `━━━━━━━━━━━━━━━━━━\n` +
+                        `🆔 <b>رقم الطلب:</b> <code>#${escapeHtml(o.id)}</code>\n` +
+                        g2gDetailLine(details[o.id]) +
+                        (o.title ? `\n📝 <b>التفاصيل:</b>\n<blockquote>${escapeHtml(o.title)}</blockquote>` : ''),
+                        {
+                            reply_markup: {
+                                inline_keyboard: [
+                                    [{ text: '🔗 فتح الطلب في G2G', url: orderUrl }]
+                                ]
+                            }
+                        }
+                    );
                 }
             }
             if (cancel > g2g.cancel) {
-                await sendTelegram(`⚠️ G2G: في طلب إلغاء جديد (العدد: ${cancel})\nhttps://www.g2g.com/g2g-user/sale`);
+                await sendTelegram(
+                    `⚠️ <b>G2G: طلب إلغاء جديد!</b>\n` +
+                    `━━━━━━━━━━━━━━━━━━\n` +
+                    `العدد الحالي: <b>${cancel}</b>`,
+                    {
+                        reply_markup: {
+                            inline_keyboard: [
+                                [{ text: '🔗 مراجعة الطلبات في G2G', url: 'https://www.g2g.com/g2g-user/sale' }]
+                            ]
+                        }
+                    }
+                );
             }
             g2g.cancel = cancel;
         }
-        if (g2g.fails >= 5) await sendTelegram('🟢 G2G: الاتصال رجع طبيعي.');
+        if (g2g.fails >= 5) await sendTelegram('🟢 <b>G2G:</b> الاتصال عاد للعمل بشكل طبيعي.');
         g2g.fails = 0;
         clearAlert('g2g-fail');
     } catch (e) {
         g2g.fails++;
         log(`G2G poll error (${g2g.fails}): ${e.message}`);
         if (g2g.fails >= 5) {
-            await alertOnce('g2g-fail', `⚠️ G2G: مش قادر أقرا الإشعارات (${e.message}).\nغالباً التوكن/الكوكيز محتاجة تحديث.`);
+            await alertOnce('g2g-fail', `⚠️ <b>G2G:</b> تعذرت قراءة الإشعارات (${escapeHtml(e.message)}).\nتأكد من صلاحية التوكن أو الكوكيز.`);
         }
     }
 }
@@ -815,7 +1278,7 @@ async function relaunchSelf() {
         log('🔁 Handoff: queued the next run (it starts as soon as this one ends).');
     } catch (e) {
         log('Handoff failed (cron will still cover it):', e.response ? JSON.stringify(e.response.data) : e.message);
-        await alertOnce('handoff', '⚠️ فشل تشغيل النسخة الجاية تلقائياً. تأكد إن الـ workflow عنده permissions: actions: write.');
+        await alertOnce('handoff', '⚠️ فشل تشغيل النسخة القادمة تلقائياً. تأكد من صلاحية <code>actions: write</code>.');
     }
 }
 
@@ -823,19 +1286,19 @@ async function relaunchSelf() {
  *  التشغيل الرئيسي
  * ============================================================ */
 const pingCycle = async () => {
-    // ترتيب عشوائي + فواصل عشوائية لمنع اكتشاف النمط
+    let fpHtml = null;
     if (Math.random() > 0.5) {
         await pingG2G();
         await sleep(randomInt(3000, 12000));
-        await pingFunPay();
+        fpHtml = await pingFunPay();
     } else {
-        await pingFunPay();
+        fpHtml = await pingFunPay();
         await sleep(randomInt(3000, 12000));
         await pingG2G();
     }
+    return fpHtml;
 };
 
-// بيشغل مهمة في الخلفية من غير ما يوقف باقي الحلقة (عشان الـ runner مايتأخرش أبداً)
 const running = new Set();
 function background(name, fn) {
     if (running.has(name)) return;
@@ -847,46 +1310,59 @@ function background(name, fn) {
     log('--> Starting HIGH-STEALTH keep-alive session for G2G & FunPay...');
     if (!FUNPAY_COOKIES) log('⚠️ WARNING: FUNPAY_COOKIES is missing in Action env variables!');
     if (!G2G_COOKIES) log('⚠️ WARNING: G2G_COOKIES is missing in Action env variables!');
-    log(`FunPay raise pages: ${RAISE_NODES.join(', ')} | every ~${(RAISE_INTERVAL_MIN[0] / 60).toFixed(1)}-${(RAISE_INTERVAL_MIN[1] / 60).toFixed(1)}h`);
+
+    // عمل Ping واكتشاف كل الأقسام من https://funpay.com/en/users/20896682/
+    const initialHtml = await pingCycle();
+    await discoverFunPayLots(true, typeof initialHtml === 'string' ? initialHtml : null);
+
+    log(`FunPay raise pages (${activeRaiseNodes.size}): ${[...activeRaiseNodes].join(', ')} | every ~${(RAISE_INTERVAL_MIN[0] / 60).toFixed(1)}-${(RAISE_INTERVAL_MIN[1] / 60).toFixed(1)}h`);
     log(`Telegram: ${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? 'configured ✅' : 'NOT configured (no alerts)'}`);
 
     if (TEST_MODE) {
         log('🧪 TEST_MODE: one cycle then exit');
         if (TELEGRAM_BOT_TOKEN && !TELEGRAM_CHAT_ID) await telegramDiscoverChatId();
         if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
-            const ok = await sendTelegram('🧪 اختبار: تيليجرام متوصل بالبوت بنجاح ✅');
+            const nodesList = [...activeRaiseNodes].map(id => nodeNames.get(id) ? `• ${nodeNames.get(id)} (${id})` : `• ${id}`).join('\n');
+            const ok = await sendTelegram(
+                `🧪 <b>اختبار البوت: متصل بنجاح ✅</b>\n` +
+                `━━━━━━━━━━━━━━━━━━\n` +
+                `🔗 <b>صفحة العروض:</b> <code>${FUNPAY_BASE}${FUNPAY_PROFILE_PATH}</code>\n` +
+                `🔍 <b>الأقسام المكتشفة للـ Boost (${activeRaiseNodes.size}):</b>\n` +
+                `<blockquote>${escapeHtml(nodesList)}</blockquote>\n` +
+                `💡 أرسل <code>/lots</code> في أي وقت لتحديث القائمة فوراً.`
+            );
             log(ok ? 'Telegram test message sent ✅' : 'Telegram test message FAILED ❌');
         }
-        await pingCycle();
         await pollRunner();
         await pollG2G();
-        RAISE_NODES.forEach(n => nextRaiseAt.set(n, 0));
+        activeRaiseNodes.forEach(n => nextRaiseAt.set(n, 0));
         await runDueRaises();
         log('🧪 TEST_MODE finished.');
         return;
     }
 
-    // مدة التشغيل: 5 ساعات و 45 دقيقة
     const endTime = Date.now() + 5.75 * 60 * 60 * 1000;
     const handoffAt = endTime - minutes(10);
     let handedOff = false;
 
-    // أول محاولة Boost بعد دقايق قليلة من بداية التشغيل (لو FunPay قال استنى، هنفهم المدة ونأجل)
-    RAISE_NODES.forEach(n => nextRaiseAt.set(n, Date.now() + minutes(randomInt(2, 12))));
+    activeRaiseNodes.forEach(n => nextRaiseAt.set(n, Date.now() + minutes(randomInt(2, 12))));
 
-    let nextPingAt = 0;
+    let nextPingAt = Date.now() + randomInt(240000, 420000);
     let nextRunnerAt = 0;
     let nextG2gAt = Date.now() + randomInt(5000, 20000);
+    let nextDiscoverAt = Date.now() + DISCOVER_INTERVAL_MS;
+    let nextTgPollAt = 0;
     let cycle = 1;
 
     while (Date.now() < endTime) {
         const now = Date.now();
 
         if (now >= nextPingAt) {
-            nextPingAt = now + randomInt(240000, 420000); // 4 إلى 7 دقائق
+            nextPingAt = now + randomInt(240000, 420000);
             const c = cycle++;
             background('ping', async () => {
-                await pingCycle();
+                const html = await pingCycle();
+                if (typeof html === 'string') await discoverFunPayLots(false, html);
                 log(`Cycle ${c} complete. Next ping in ~${((nextPingAt - Date.now()) / 60000).toFixed(1)} min.`);
             });
         }
@@ -901,7 +1377,17 @@ function background(name, fn) {
             background('g2g', pollG2G);
         }
 
-        if (RAISE_NODES.some(n => (nextRaiseAt.get(n) || 0) <= now)) {
+        if (now >= nextDiscoverAt) {
+            nextDiscoverAt = now + DISCOVER_INTERVAL_MS;
+            background('discover', () => discoverFunPayLots(false));
+        }
+
+        if (now >= nextTgPollAt) {
+            nextTgPollAt = now + 3500;
+            background('tg-poll', pollTelegramUpdates);
+        }
+
+        if ([...activeRaiseNodes].some(n => (nextRaiseAt.get(n) || 0) <= now)) {
             background('raise', runDueRaises);
         }
 
@@ -910,10 +1396,9 @@ function background(name, fn) {
             background('handoff', relaunchSelf);
         }
 
-        await sleep(randomInt(3000, 6000));
+        await sleep(randomInt(2000, 4000));
     }
 
     log('--> Stealth session finished naturally after ~5 hours and 45 minutes.');
-    // نستنى أي مهمة شغالة تخلص بسرعة
     for (let i = 0; i < 20 && running.size; i++) await sleep(1000);
 })();
